@@ -27,19 +27,21 @@ namespace UnitTestForDubboNet
 {
     public class NativeDubboActuatorSuiteTest
     {
-        [Fact]
-        public async Task SendQuery_LargeListReachesTheFinalJsonResult()
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public async Task SendQuery_LargeListReachesTheFinalJsonResult(bool isEvent)
         {
             List<long> expected = Enumerable.Range(0, 150_000)
                 .Select(value => (long)value)
                 .ToList();
             byte[] body = EncodeBody(output =>
             {
-                output.WriteInt(1); // Value.
+                if (!isEvent) output.WriteInt(1); // Ordinary responses include a result kind.
                 output.WriteObject(expected);
             });
 
-            DubboRequestResult result = await QueryResponse(body);
+            DubboRequestResult result = await QueryResponse(body, flags: isEvent ? (byte)0x22 : (byte)0x02);
 
             Assert.True(result.QuerySuccess, result.ErrorMeaasge);
             Assert.Null(result.ErrorMeaasge);
@@ -114,6 +116,104 @@ namespace UnitTestForDubboNet
         }
 
         [Fact]
+        public async Task SendQuery_LargeProtocolErrorUsesTheBodySizedJsonBudget()
+        {
+            const int messageLength = 6 * 1024 * 1024;
+            byte[] body = ChunkedAsciiString(messageLength, (byte)'"');
+            long expectedJsonBytes = 6L * messageLength + 2; // Quotes become \u0022.
+            Assert.InRange(body.Length, 4 * 1024 * 1024 + 1, 8 * 1024 * 1024);
+            Assert.InRange(expectedJsonBytes, 32L * 1024 * 1024 + 1, 8L * body.Length);
+
+            DubboRequestResult result = await QueryResponse(body, status: 70);
+
+            Assert.False(result.QuerySuccess);
+            Assert.Equal((byte?)70, result.ResponseStatus);
+            Assert.Null(result.RawResult);
+            Assert.Equal(messageLength, result.ErrorMeaasge.Length);
+            Assert.Equal('"', result.ErrorMeaasge[0]);
+            Assert.Equal('"', result.ErrorMeaasge[^1]);
+            Assert.Equal(expectedJsonBytes, result.Result.Length);
+            Assert.StartsWith("\"\\u0022", result.Result);
+            Assert.EndsWith("\\u0022\"", result.Result);
+        }
+
+        [Fact]
+        public async Task SendQuery_NullEventStillSerializesAsNull()
+        {
+            DubboRequestResult result = await QueryResponse(new byte[] { (byte)'N' }, flags: 0x22);
+
+            Assert.True(result.QuerySuccess, result.ErrorMeaasge);
+            Assert.Null(result.ErrorMeaasge);
+            Assert.Null(result.RawResult);
+            Assert.Equal("null", result.Result);
+        }
+
+        [Fact]
+        public async Task SendQuery_LargeSharedEventUsesTheBodySizedJsonBudget()
+        {
+            const int stringLength = 5 * 1024 * 1024;
+            const int occurrences = 7;
+            byte[] body = SharedStringEvent(stringLength, occurrences);
+            long expectedJsonBytes = occurrences * (stringLength + 5L) + 1;
+            Assert.InRange(body.Length, 4 * 1024 * 1024 + 1, 8 * 1024 * 1024);
+            Assert.InRange(expectedJsonBytes, 32L * 1024 * 1024 + 1, 8L * body.Length);
+
+            DubboRequestResult result = await QueryResponse(body, flags: 0x22);
+
+            Assert.True(result.QuerySuccess, result.ErrorMeaasge);
+            Assert.Null(result.ErrorMeaasge);
+            var root = Assert.IsType<List<object>>(result.RawResult);
+            Assert.Equal(occurrences, root.Count);
+            string text = Assert.IsType<string>(Assert.Single(Assert.IsType<List<object>>(root[0])));
+            Assert.Equal(stringLength, text.Length);
+            Assert.All(root, item => Assert.Same(text, Assert.Single(Assert.IsType<List<object>>(item))));
+            // The fixture and its JSON are ASCII; avoid parsing another large result tree.
+            Assert.Equal(expectedJsonBytes, result.Result.Length);
+        }
+
+        [Fact]
+        public async Task SendQuery_EventReferencesCannotExceedTheBodySizedNodeBudget()
+        {
+            const int count = 60_000;
+            // Root list (ref 0), a 60K-zero list (ref 1), then two references to ref 1.
+            byte[] body = new byte[count + 12];
+            body[0] = 0x57;
+            body[1] = 0x58;
+            body[2] = (byte)'I';
+            BinaryPrimitives.WriteInt32BigEndian(body.AsSpan(3, 4), count);
+            body.AsSpan(7, count).Fill(0x90);
+            new byte[] { 0x51, 0x91, 0x51, 0x91, (byte)'Z' }.CopyTo(body, count + 7);
+            int expectedNodeLimit = 2 * body.Length;
+            Assert.InRange(expectedNodeLimit, 100_001, 1_999_999);
+            Assert.True(1 + 3 * (count + 1) > expectedNodeLimit);
+
+            DubboRequestResult result = await QueryResponse(body, flags: 0x22);
+
+            Assert.False(result.QuerySuccess);
+            Assert.NotNull(result.RawResult);
+            Assert.Null(result.Result);
+            Assert.Contains($"limit of {expectedNodeLimit} nodes", result.ErrorMeaasge);
+        }
+
+        [Fact]
+        public async Task SendQuery_EventSharedStringsCannotExceedTheBodySizedJsonBudget()
+        {
+            const int stringLength = 5 * 1024 * 1024;
+            const int occurrences = 9;
+            byte[] body = SharedStringEvent(stringLength, occurrences);
+            long expectedJsonByteLimit = 8L * body.Length;
+            Assert.InRange(expectedJsonByteLimit, 32L * 1024 * 1024 + 1, 64L * 1024 * 1024 - 1);
+            Assert.True(occurrences * (stringLength + 5L) + 1 > expectedJsonByteLimit);
+
+            DubboRequestResult result = await QueryResponse(body, flags: 0x22);
+
+            Assert.False(result.QuerySuccess);
+            Assert.NotNull(result.RawResult);
+            Assert.Null(result.Result);
+            Assert.Contains($"JSON size budget of {expectedJsonByteLimit} bytes", result.ErrorMeaasge);
+        }
+
+        [Fact]
         public async Task SendQuery_CircularEventStillUsesSafeNormalization()
         {
             // An event value containing an untyped list that references itself.
@@ -159,6 +259,43 @@ namespace UnitTestForDubboNet
             HessianOutputV2 output = new HessianOutputV2(writer, TypeBindings.Java);
             write(output);
             return stream.ToArray();
+        }
+
+        private static byte[] ChunkedAsciiString(int length, byte character)
+        {
+            int chunks = (length + ushort.MaxValue - 1) / ushort.MaxValue;
+            byte[] body = new byte[length + 3 * chunks];
+            int offset = 0;
+            int remaining = length;
+            while (remaining > 0)
+            {
+                int chunkLength = Math.Min(remaining, ushort.MaxValue);
+                body[offset++] = remaining > chunkLength ? (byte)'R' : (byte)'S';
+                BinaryPrimitives.WriteUInt16BigEndian(body.AsSpan(offset, 2), (ushort)chunkLength);
+                offset += 2;
+                body.AsSpan(offset, chunkLength).Fill(character);
+                offset += chunkLength;
+                remaining -= chunkLength;
+            }
+            return body;
+        }
+
+        private static byte[] SharedStringEvent(int stringLength, int occurrences)
+        {
+            // Literal Hessian bytes: root list ref 0; one-item list ref 1.
+            byte[] value = ChunkedAsciiString(stringLength, (byte)'x');
+            byte[] body = new byte[value.Length + 2 * occurrences + 1];
+            body[0] = 0x57;
+            body[1] = 0x79;
+            value.CopyTo(body, 2);
+            int offset = value.Length + 2;
+            for (int index = 1; index < occurrences; index++)
+            {
+                body[offset++] = 0x51;
+                body[offset++] = 0x91;
+            }
+            body[offset] = (byte)'Z';
+            return body;
         }
 
         private static byte[] ReferenceDag(int layers)

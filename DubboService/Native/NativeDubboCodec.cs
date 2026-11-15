@@ -191,7 +191,8 @@ namespace DubboNet.DubboService.Native
                 RequestId = frame.RequestId,
                 Status = frame.Status,
                 SerializationId = frame.SerializationId,
-                IsEvent = frame.IsEvent
+                IsEvent = frame.IsEvent,
+                PayloadLength = frame.Body.Length
             };
 
             if (frame.SerializationId != Hessian2SerializationId)
@@ -307,16 +308,18 @@ namespace DubboNet.DubboService.Native
             return new DubboInvocation(service, method, parameterTypes, arguments);
         }
 
-        internal static string SerializeJson(object value)
+        internal static string SerializeJson(object value, int payloadLength = 0)
         {
-            return JsonSerializer.Serialize(ToJsonCompatible(value), ResultJsonOptions);
+            return JsonSerializer.Serialize(
+                ToJsonCompatible(value, new NormalizationBudget(payloadLength)),
+                ResultJsonOptions);
         }
 
         /// <summary>
         /// 将已解码且未修改的成功状态响应输出为 JSON；普通返回值和异常已完成规范化检查。
         /// <para>EN: Serializes an unmodified OK-status response returned by DecodeResponse.
         /// Ordinary values and exceptions have already been normalized and budget-checked;
-        /// event values still use the checked serialization path.</para>
+        /// event values use the same body-sized budget during serialization.</para>
         /// </summary>
         internal static string SerializeResponseJson(NativeDubboResponse response)
         {
@@ -324,7 +327,7 @@ namespace DubboNet.DubboService.Native
 
             if (response.IsEvent)
             {
-                return SerializeJson(value);
+                return SerializeJson(value, response.PayloadLength);
             }
 
             return JsonSerializer.Serialize(value, ResultJsonOptions);
@@ -946,6 +949,7 @@ namespace DubboNet.DubboService.Native
         public byte Status { get; set; }
         public byte SerializationId { get; set; }
         public bool IsEvent { get; set; }
+        public int PayloadLength { get; set; }
         public int ResultKind { get; set; } = -1;
         public object Value { get; set; }
         public object Exception { get; set; }
