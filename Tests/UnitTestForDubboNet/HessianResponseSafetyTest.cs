@@ -411,6 +411,72 @@ public class HessianResponseSafetyTest
         Assert.Contains($"{NativeDubboCodec.MaxNormalizedNodes} nodes", error.Message);
     }
 
+    [Fact]
+    public void JsonByteBudgetAcceptsJustBelowAbsoluteLimit()
+    {
+        byte[] body = JsonByteBoundaryResponse(escapedQuotes: 79);
+        Assert.Equal(NativeDubboCodec.DefaultMaxPayloadLength, body.Length);
+
+        NativeDubboResponse response = Decode(body);
+        var root = Assert.IsType<List<object>>(response.Value);
+        Assert.Equal(8, root.Count);
+        string text = Assert.IsType<string>(Assert.Single(Assert.IsType<List<object>>(root[0])));
+        Assert.Equal(8_388_206, text.Length);
+        Assert.All(root, item => Assert.Same(text, Assert.Single(Assert.IsType<List<object>>(item))));
+
+        string json = NativeDubboCodec.SerializeResponseJson(response);
+        // The conservative budget reserves ten more bytes than this actual JSON.
+        Assert.Equal(64L * 1024 * 1024 - 15, Encoding.UTF8.GetByteCount(json));
+    }
+
+    [Fact]
+    public void JsonByteBudgetRejectsJustAboveAbsoluteLimit()
+    {
+        byte[] body = JsonByteBoundaryResponse(escapedQuotes: 80);
+        Assert.Equal(NativeDubboCodec.DefaultMaxPayloadLength, body.Length);
+
+        // One more quote in the shared string adds 40 bytes across eight occurrences:
+        // actual JSON would exceed 64 MiB by 25 bytes; the budget exceeds it by 35.
+        var error = Assert.Throws<InvalidDataException>(() => Decode(body));
+        Assert.Contains($"JSON size budget of {64L * 1024 * 1024} bytes", error.Message);
+    }
+
+    private static byte[] JsonByteBoundaryResponse(int escapedQuotes)
+    {
+        // 128 three-byte string chunk headers and 18 framing/reference bytes fill
+        // an 8 MiB response. Literal wire bytes keep the fixture independent of the codec.
+        const int stringLength = 8_388_206;
+        byte[] body = new byte[8 * 1024 * 1024];
+        int offset = 0;
+        body[offset++] = 0x91; // Value.
+        body[offset++] = 0x57; // Variable-length outer list: ref 0.
+        body[offset++] = 0x79; // One-element inner list: ref 1.
+
+        int remaining = stringLength;
+        while (remaining > 0)
+        {
+            int length = Math.Min(remaining, ushort.MaxValue);
+            body[offset++] = remaining > length ? (byte)'R' : (byte)'S';
+            body[offset++] = (byte)(length >> 8);
+            body[offset++] = (byte)length;
+            body.AsSpan(offset, length).Fill((byte)'x');
+            int quotes = Math.Min(escapedQuotes, length);
+            body.AsSpan(offset, quotes).Fill((byte)'"');
+            escapedQuotes -= quotes;
+            offset += length;
+            remaining -= length;
+        }
+
+        for (int index = 1; index < 8; index++)
+        {
+            body[offset++] = 0x51;
+            body[offset++] = 0x91; // Reference the inner list seven more times.
+        }
+        body[offset++] = (byte)'Z';
+        Assert.Equal(body.Length, offset);
+        return body;
+    }
+
     private static List<byte> Dag(int layers)
     {
         var body = new List<byte> { 0x91, 0x57, 0x79, 0x90 };
