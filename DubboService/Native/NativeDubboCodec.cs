@@ -308,7 +308,7 @@ namespace DubboNet.DubboService.Native
             return new DubboInvocation(service, method, parameterTypes, arguments);
         }
 
-        internal static string SerializeJson(object value, int payloadLength = 0)
+        internal static string SerializeJson(object value, int payloadLength)
         {
             return JsonSerializer.Serialize(
                 ToJsonCompatible(value, new NormalizationBudget(payloadLength)),

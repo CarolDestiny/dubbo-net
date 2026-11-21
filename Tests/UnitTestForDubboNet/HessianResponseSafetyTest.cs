@@ -215,14 +215,14 @@ public class HessianResponseSafetyTest
     {
         // Construct UTF-16 directly so UTF-8 encoding cannot replace the test data.
         string unit = new string((char)codeUnit, 1);
-        string json = NativeDubboCodec.SerializeJson(unit);
+        string json = NativeDubboCodec.SerializeJson(unit, payloadLength: 0);
         Assert.Equal("\ufffd", JsonSerializer.Deserialize<string>(json));
 
         string text = new string((char)codeUnit, 60_000);
         List<object> values = Enumerable.Repeat<object>(text, 101).ToList();
 
         var error = Assert.Throws<InvalidDataException>(
-            () => NativeDubboCodec.SerializeJson(values));
+            () => NativeDubboCodec.SerializeJson(values, payloadLength: 0));
         Assert.Contains("JSON size budget", error.Message);
     }
 
@@ -236,7 +236,7 @@ public class HessianResponseSafetyTest
             .ToList();
 
         var error = Assert.Throws<InvalidDataException>(
-            () => NativeDubboCodec.SerializeJson(values));
+            () => NativeDubboCodec.SerializeJson(values, payloadLength: 0));
         Assert.Contains("JSON size budget", error.Message);
     }
 
@@ -308,7 +308,7 @@ public class HessianResponseSafetyTest
         };
 
         using JsonDocument document = JsonDocument.Parse(
-            NativeDubboCodec.SerializeJson(values));
+            NativeDubboCodec.SerializeJson(values, payloadLength: 0));
         Assert.Equal(values.Length, document.RootElement.GetArrayLength());
         for (int index = 0; index < values.Length; index++)
         {
@@ -363,7 +363,7 @@ public class HessianResponseSafetyTest
         var root = Assert.IsType<List<object>>(Decode(Dag(3)).Value);
         Assert.Equal(4, root.Count);
         Assert.Equal("[[0],[[0],[0]],[[[0],[0]],[[0],[0]]],[[[[0],[0]],[[0],[0]]],[[[0],[0]],[[0],[0]]]]]",
-            NativeDubboCodec.SerializeJson(root));
+            NativeDubboCodec.SerializeJson(root, payloadLength: 0));
     }
 
     [Theory]
@@ -421,12 +421,17 @@ public class HessianResponseSafetyTest
         var root = Assert.IsType<List<object>>(response.Value);
         Assert.Equal(8, root.Count);
         string text = Assert.IsType<string>(Assert.Single(Assert.IsType<List<object>>(root[0])));
-        Assert.Equal(8_388_206, text.Length);
         Assert.All(root, item => Assert.Same(text, Assert.Single(Assert.IsType<List<object>>(item))));
 
         string json = NativeDubboCodec.SerializeResponseJson(response);
-        // The conservative budget reserves ten more bytes than this actual JSON.
-        Assert.Equal(64L * 1024 * 1024 - 15, Encoding.UTF8.GetByteCount(json));
+        long jsonBytes = Encoding.UTF8.GetByteCount(json);
+        long nextQuoteIncrease = root.Count * (
+            Encoding.UTF8.GetByteCount(NativeDubboCodec.SerializeJson("\"", payloadLength: 0)) -
+            Encoding.UTF8.GetByteCount(NativeDubboCodec.SerializeJson("x", payloadLength: 0)));
+        // This output fits; replacing one more shared 'x' with a quote crosses the cap.
+        Assert.InRange(jsonBytes,
+            NativeDubboCodec.MaxNormalizedJsonBytes - nextQuoteIncrease + 1,
+            NativeDubboCodec.MaxNormalizedJsonBytes - 1);
     }
 
     [Fact]
@@ -435,10 +440,9 @@ public class HessianResponseSafetyTest
         byte[] body = JsonByteBoundaryResponse(escapedQuotes: 80);
         Assert.Equal(NativeDubboCodec.DefaultMaxPayloadLength, body.Length);
 
-        // One more quote in the shared string adds 40 bytes across eight occurrences:
-        // actual JSON would exceed 64 MiB by 25 bytes; the budget exceeds it by 35.
+        // One more quote in the shared string crosses the cap across its occurrences.
         var error = Assert.Throws<InvalidDataException>(() => Decode(body));
-        Assert.Contains($"JSON size budget of {64L * 1024 * 1024} bytes", error.Message);
+        Assert.Contains($"JSON size budget of {NativeDubboCodec.MaxNormalizedJsonBytes} bytes", error.Message);
     }
 
     private static byte[] JsonByteBoundaryResponse(int escapedQuotes)
